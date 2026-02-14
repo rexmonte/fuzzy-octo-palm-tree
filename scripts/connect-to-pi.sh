@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-PI_HOSTNAME="${PI_HOSTNAME:-raspberrypi.local}"
+PI_HOSTNAME="${PI_HOSTNAME:-umbrel.local}"
 GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-18790}"
 MODE="${1:-check}"
 
@@ -133,35 +133,106 @@ run_diagnostics() {
 
 connect_direct() {
     local TARGET="${2:-}"
+    local MAX_RETRIES="${MAX_RETRIES:-0}"  # 0 = infinite
+    local RETRY_DELAY=5
+    local MAX_DELAY=120
+    local ATTEMPT=0
 
     if [ -z "$TARGET" ]; then
         log "Resolving Pi..."
         TARGET=$(resolve_pi) || exit 1
     fi
 
-    log "Connecting to Pi gateway at $TARGET:$GATEWAY_PORT..."
-    echo ""
-    exec openclaw node run --host "$TARGET" --port "$GATEWAY_PORT"
+    while true; do
+        ATTEMPT=$((ATTEMPT + 1))
+        log "Connecting to Pi gateway at $TARGET:$GATEWAY_PORT (attempt $ATTEMPT)..."
+        echo ""
+
+        # Run openclaw node — this blocks while connected
+        openclaw node run --host "$TARGET" --port "$GATEWAY_PORT" && {
+            # Clean exit — user probably ctrl+c'd
+            log "Node disconnected cleanly."
+            break
+        }
+
+        EXIT_CODE=$?
+        log "Node connection lost (exit code $EXIT_CODE)"
+
+        # Respect retry limit
+        if [ "$MAX_RETRIES" -gt 0 ] && [ "$ATTEMPT" -ge "$MAX_RETRIES" ]; then
+            fail "Max retries ($MAX_RETRIES) reached. Giving up."
+            exit 1
+        fi
+
+        # Re-resolve Pi IP in case it changed (DHCP)
+        log "Re-resolving Pi address..."
+        NEW_TARGET=$(resolve_pi 2>/dev/null) || true
+        if [ -n "$NEW_TARGET" ] && [ "$NEW_TARGET" != "$TARGET" ]; then
+            log "Pi IP changed: $TARGET → $NEW_TARGET"
+            TARGET="$NEW_TARGET"
+        fi
+
+        log "Retrying in ${RETRY_DELAY}s..."
+        sleep "$RETRY_DELAY"
+
+        # Exponential backoff capped at MAX_DELAY
+        RETRY_DELAY=$((RETRY_DELAY * 2))
+        if [ "$RETRY_DELAY" -gt "$MAX_DELAY" ]; then
+            RETRY_DELAY=$MAX_DELAY
+        fi
+    done
 }
 
 connect_tunnel() {
     local PI_USER="${2:-}"
     local PI_IP="${3:-}"
+    local RETRY_DELAY=5
+    local MAX_DELAY=60
 
     if [ -z "$PI_USER" ] || [ -z "$PI_IP" ]; then
         echo "Usage: $0 tunnel <pi-user> <pi-ip>"
-        echo "Example: $0 tunnel pi 192.168.0.50"
+        echo "Example: $0 tunnel umbrel 192.168.0.50"
         exit 1
     fi
 
-    log "Creating SSH tunnel to $PI_USER@$PI_IP..."
-    log "Forwarding localhost:$GATEWAY_PORT → Pi:$GATEWAY_PORT"
-    echo ""
-    log "Keep this terminal open. In a NEW terminal, run:"
-    echo "  openclaw node run --host 127.0.0.1 --port $GATEWAY_PORT"
-    echo ""
+    # Check for autossh (preferred — handles keepalive + reconnect natively)
+    if command -v autossh &>/dev/null; then
+        log "Using autossh for persistent tunnel to $PI_USER@$PI_IP..."
+        log "Forwarding localhost:$GATEWAY_PORT → Pi:$GATEWAY_PORT"
+        echo ""
+        log "In a NEW terminal, run:"
+        echo "  openclaw node run --host 127.0.0.1 --port $GATEWAY_PORT"
+        echo ""
+        AUTOSSH_GATETIME=0 autossh -M 0 -N \
+            -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+            -o "ExitOnForwardFailure=yes" \
+            -L "$GATEWAY_PORT:127.0.0.1:$GATEWAY_PORT" "$PI_USER@$PI_IP"
+    else
+        log "autossh not found — using reconnecting ssh loop"
+        log "(Install autossh for better reliability: brew install autossh)"
+        echo ""
 
-    ssh -N -L "$GATEWAY_PORT:127.0.0.1:$GATEWAY_PORT" "$PI_USER@$PI_IP"
+        while true; do
+            log "Creating SSH tunnel to $PI_USER@$PI_IP..."
+            log "Forwarding localhost:$GATEWAY_PORT → Pi:$GATEWAY_PORT"
+            echo ""
+            log "In a NEW terminal, run:"
+            echo "  openclaw node run --host 127.0.0.1 --port $GATEWAY_PORT"
+            echo ""
+
+            ssh -N \
+                -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+                -o "ExitOnForwardFailure=yes" \
+                -L "$GATEWAY_PORT:127.0.0.1:$GATEWAY_PORT" "$PI_USER@$PI_IP"
+
+            log "SSH tunnel dropped. Reconnecting in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+            RETRY_DELAY=$((RETRY_DELAY * 2))
+            if [ "$RETRY_DELAY" -gt "$MAX_DELAY" ]; then
+                RETRY_DELAY=$MAX_DELAY
+            fi
+        done
+    fi
 }
 
 # --- Main ---
@@ -186,7 +257,7 @@ case "$MODE" in
         echo "  tunnel <user> <ip> Create SSH tunnel then connect"
         echo ""
         echo "Environment variables:"
-        echo "  PI_HOSTNAME              Pi hostname (default: raspberrypi.local)"
+        echo "  PI_HOSTNAME              Pi hostname (default: umbrel.local)"
         echo "  OPENCLAW_GATEWAY_PORT    Gateway port (default: 18790)"
         exit 1
         ;;

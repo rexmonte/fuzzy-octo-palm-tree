@@ -27,7 +27,7 @@ The Mac Mini runs as a **node host** connected to the Pi's OpenClaw gateway. The
 
 ### Common Issues
 
-**`ENOTFOUND raspberrypi.local`** — Pi hostname can't be resolved via mDNS.
+**`ENOTFOUND umbrel.local`** — Pi hostname can't be resolved via mDNS.
 - Ensure avahi-daemon is running on the Pi: `sudo systemctl enable --now avahi-daemon`
 - Or use the Pi's IP address directly instead of the hostname
 
